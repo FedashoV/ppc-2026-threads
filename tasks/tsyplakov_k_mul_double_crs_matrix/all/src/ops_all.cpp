@@ -2,8 +2,9 @@
 
 #include <mpi.h>
 
-#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -16,43 +17,136 @@ namespace tsyplakov_k_mul_double_crs_matrix {
 
 namespace {
 
+struct Distribution {
+  int start_row{};
+  int local_rows{};
+};
+
+Distribution GetDistribution(int rows, int rank, int size) {
+  const int rows_per_process = rows / size;
+  const int remainder = rows % size;
+
+  Distribution distribution;
+
+  distribution.start_row =
+      (rank * rows_per_process) + std::min(rank, remainder);
+
+  distribution.local_rows =
+      rows_per_process + ((rank < remainder) ? 1 : 0);
+
+  return distribution;
+}
+
 void ComputeRow(const SparseMatrixCRS& a,
                 const SparseMatrixCRS& b,
                 int row,
                 std::vector<double>& values,
                 std::vector<int>& cols) {
-  std::vector<double> accumulator(b.cols, 0.0);
-  std::vector<int> used_cols;
+  std::unordered_map<int, double> accumulator;
 
-  for (int idx_a = a.row_ptr[row]; idx_a < a.row_ptr[row + 1]; ++idx_a) {
+  for (int idx_a = a.row_ptr[row];
+       idx_a < a.row_ptr[row + 1];
+       ++idx_a) {
     const int k = a.col_index[idx_a];
     const double val_a = a.values[idx_a];
 
-    for (int idx_b = b.row_ptr[k]; idx_b < b.row_ptr[k + 1]; ++idx_b) {
+    for (int idx_b = b.row_ptr[k];
+         idx_b < b.row_ptr[k + 1];
+         ++idx_b) {
       const int col = b.col_index[idx_b];
-
-      if (std::fabs(accumulator[col]) < 1e-12) {
-        used_cols.push_back(col);
-      }
 
       accumulator[col] += val_a * b.values[idx_b];
     }
   }
 
-  values.reserve(used_cols.size());
-  cols.reserve(used_cols.size());
+  values.reserve(accumulator.size());
+  cols.reserve(accumulator.size());
 
-  for (const int col : used_cols) {
-    if (std::fabs(accumulator[col]) > 1e-12) {
+  for (const auto& [col, val] : accumulator) {
+    if (std::fabs(val) > 1e-12) {
       cols.push_back(col);
-      values.push_back(accumulator[col]);
+      values.push_back(val);
     }
+  }
+}
+
+void ComputeLocalRows(
+    const SparseMatrixCRS& a,
+    const SparseMatrixCRS& b,
+    int start_row,
+    int local_rows,
+    std::vector<std::vector<double>>& local_values,
+    std::vector<std::vector<int>>& local_cols) {
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, local_rows),
+      [&](const tbb::blocked_range<int>& range) {
+        for (int local_row = range.begin();
+             local_row < range.end();
+             ++local_row) {
+          const int global_row = start_row + local_row;
+
+          ComputeRow(a,
+                     b,
+                     global_row,
+                     local_values[local_row],
+                     local_cols[local_row]);
+        }
+      });
+}
+
+SparseMatrixCRS BuildLocalMatrix(
+    int local_rows,
+    int cols,
+    const std::vector<std::vector<double>>& local_values,
+    const std::vector<std::vector<int>>& local_cols) {
+  SparseMatrixCRS local_matrix(local_rows, cols);
+
+  for (int i = 0; i < local_rows; ++i) {
+    local_matrix.row_ptr[i + 1] =
+        local_matrix.row_ptr[i] +
+        static_cast<int>(local_values[i].size());
+  }
+
+  const int local_nnz =
+      local_matrix.row_ptr[local_rows];
+
+  local_matrix.values.reserve(local_nnz);
+  local_matrix.col_index.reserve(local_nnz);
+
+  for (int i = 0; i < local_rows; ++i) {
+    local_matrix.values.insert(
+        local_matrix.values.end(),
+        local_values[i].begin(),
+        local_values[i].end());
+
+    local_matrix.col_index.insert(
+        local_matrix.col_index.end(),
+        local_cols[i].begin(),
+        local_cols[i].end());
+  }
+
+  return local_matrix;
+}
+
+void BuildDisplacements(const std::vector<int>& recv_counts,
+                        std::vector<int>& displs) {
+  for (std::size_t i = 1; i < recv_counts.size(); ++i) {
+    displs[i] = displs[i - 1] + recv_counts[i - 1];
+  }
+}
+
+void BuildRowPtr(SparseMatrixCRS& matrix,
+                 const std::vector<int>& row_sizes) {
+  for (int i = 0; i < matrix.rows; ++i) {
+    matrix.row_ptr[i + 1] =
+        matrix.row_ptr[i] + row_sizes[i];
   }
 }
 
 }  // namespace
 
-TsyplakovKTestTaskALL::TsyplakovKTestTaskALL(const InType& in) {
+TsyplakovKTestTaskALL::TsyplakovKTestTaskALL(
+    const InType& in) {
   SetTypeOfTask(GetStaticTypeOfTask());
   GetInput() = in;
 }
@@ -79,58 +173,32 @@ bool TsyplakovKTestTaskALL::RunImpl() {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  const int rows = a.rows;
+  const Distribution distribution =
+      GetDistribution(a.rows, rank, size);
 
-  const int rows_per_process = rows / size;
-  const int remainder = rows % size;
+  std::vector<std::vector<double>> local_values(
+      distribution.local_rows);
 
-  const int start_row =
-      (rank * rows_per_process) + std::min(rank, remainder);
+  std::vector<std::vector<int>> local_cols(
+      distribution.local_rows);
 
-  const int local_rows =
-      rows_per_process + ((rank < remainder) ? 1 : 0);
+  ComputeLocalRows(
+      a,
+      b,
+      distribution.start_row,
+      distribution.local_rows,
+      local_values,
+      local_cols);
 
-  const int end_row = start_row + local_rows;
+  SparseMatrixCRS local_matrix =
+      BuildLocalMatrix(
+          distribution.local_rows,
+          b.cols,
+          local_values,
+          local_cols);
 
-  std::vector<std::vector<double>> local_values(local_rows);
-  std::vector<std::vector<int>> local_cols(local_rows);
-
-  tbb::parallel_for(
-      tbb::blocked_range<int>(start_row, end_row),
-      [&](const tbb::blocked_range<int>& range) {
-        for (int row = range.begin(); row < range.end(); ++row) {
-          const int local_index = row - start_row;
-
-          ComputeRow(a,
-                     b,
-                     row,
-                     local_values[local_index],
-                     local_cols[local_index]);
-        }
-      });
-
-  SparseMatrixCRS local_matrix(local_rows, b.cols);
-
-  for (int i = 0; i < local_rows; ++i) {
-    local_matrix.row_ptr[i + 1] =
-        local_matrix.row_ptr[i] +
-        static_cast<int>(local_values[i].size());
-  }
-
-  const int local_nnz = local_matrix.row_ptr[local_rows];
-
-  local_matrix.values.reserve(local_nnz);
-  local_matrix.col_index.reserve(local_nnz);
-
-  for (int i = 0; i < local_rows; ++i) {
-    local_matrix.values.insert(local_matrix.values.end(),
-                               local_values[i].begin(),
-                               local_values[i].end());
-
-    local_matrix.col_index.insert(local_matrix.col_index.end(),
-                                  local_cols[i].begin(),
-                                  local_cols[i].end());
-  }
+  const int local_nnz =
+      local_matrix.row_ptr[distribution.local_rows];
 
   std::vector<int> recv_nnz(size);
   std::vector<int> recv_rows(size);
@@ -144,7 +212,7 @@ bool TsyplakovKTestTaskALL::RunImpl() {
              0,
              MPI_COMM_WORLD);
 
-  MPI_Gather(&local_rows,
+  MPI_Gather(&distribution.local_rows,
              1,
              MPI_INT,
              recv_rows.data(),
@@ -156,147 +224,90 @@ bool TsyplakovKTestTaskALL::RunImpl() {
   std::vector<int> displs_nnz(size, 0);
   std::vector<int> displs_rows(size, 0);
 
-  int total_nnz = 0;
-
   if (rank == 0) {
-    for (int i = 1; i < size; ++i) {
-      displs_nnz[i] =
-          displs_nnz[i - 1] + recv_nnz[i - 1];
-
-      displs_rows[i] =
-          displs_rows[i - 1] + recv_rows[i - 1];
-    }
-
-    total_nnz =
-        displs_nnz[size - 1] + recv_nnz[size - 1];
-  }
-
-  SparseMatrixCRS result_matrix;
-
-  double* recv_values = nullptr;
-  int* recv_cols = nullptr;
-  int* recv_row_sizes = nullptr;
-
-  std::vector<int> gathered_row_sizes;
-
-  if (rank == 0) {
-    result_matrix.rows = rows;
-    result_matrix.cols = b.cols;
-
-    result_matrix.values.resize(total_nnz);
-    result_matrix.col_index.resize(total_nnz);
-    result_matrix.row_ptr.resize(rows + 1, 0);
-
-    recv_values = result_matrix.values.data();
-    recv_cols = result_matrix.col_index.data();
-
-    gathered_row_sizes.resize(rows);
-    recv_row_sizes = gathered_row_sizes.data();
-  }
-
-  double* send_values =
-      local_matrix.values.empty()
-          ? nullptr
-          : local_matrix.values.data();
-
-  int* send_cols =
-      local_matrix.col_index.empty()
-          ? nullptr
-          : local_matrix.col_index.data();
-
-  MPI_Gatherv(send_values,
-              local_nnz,
-              MPI_DOUBLE,
-              recv_values,
-              recv_nnz.data(),
-              displs_nnz.data(),
-              MPI_DOUBLE,
-              0,
-              MPI_COMM_WORLD);
-
-  MPI_Gatherv(send_cols,
-              local_nnz,
-              MPI_INT,
-              recv_cols,
-              recv_nnz.data(),
-              displs_nnz.data(),
-              MPI_INT,
-              0,
-              MPI_COMM_WORLD);
-
-  std::vector<int> local_row_sizes(local_rows);
-
-  for (int i = 0; i < local_rows; ++i) {
-    local_row_sizes[i] =
-        static_cast<int>(local_values[i].size());
-  }
-
-  int* send_row_sizes =
-      local_row_sizes.empty()
-          ? nullptr
-          : local_row_sizes.data();
-
-  MPI_Gatherv(send_row_sizes,
-              local_rows,
-              MPI_INT,
-              recv_row_sizes,
-              recv_rows.data(),
-              displs_rows.data(),
-              MPI_INT,
-              0,
-              MPI_COMM_WORLD);
-
-  if (rank == 0) {
-    for (int i = 0; i < rows; ++i) {
-      result_matrix.row_ptr[i + 1] =
-          result_matrix.row_ptr[i] +
-          gathered_row_sizes[i];
-    }
+    BuildDisplacements(recv_nnz, displs_nnz);
+    BuildDisplacements(recv_rows, displs_rows);
   }
 
   int global_nnz = 0;
 
-  if (rank == 0) {
+  if (rank == 0 && !recv_nnz.empty()) {
     global_nnz =
-        static_cast<int>(result_matrix.values.size());
+        displs_nnz.back() + recv_nnz.back();
   }
 
-  MPI_Bcast(&global_nnz,
-            1,
-            MPI_INT,
-            0,
-            MPI_COMM_WORLD);
+  SparseMatrixCRS result_matrix;
 
-  if (rank != 0) {
-    result_matrix.rows = rows;
+  if (rank == 0) {
+    result_matrix.rows = a.rows;
     result_matrix.cols = b.cols;
 
     result_matrix.values.resize(global_nnz);
     result_matrix.col_index.resize(global_nnz);
-    result_matrix.row_ptr.resize(rows + 1);
+    result_matrix.row_ptr.resize(a.rows + 1, 0);
   }
 
-  MPI_Bcast(result_matrix.row_ptr.data(),
-            rows + 1,
-            MPI_INT,
-            0,
-            MPI_COMM_WORLD);
+  MPI_Gatherv(
+      local_matrix.values.data(),
+      local_nnz,
+      MPI_DOUBLE,
+      rank == 0
+          ? result_matrix.values.data()
+          : nullptr,
+      recv_nnz.data(),
+      displs_nnz.data(),
+      MPI_DOUBLE,
+      0,
+      MPI_COMM_WORLD);
 
-  if (global_nnz > 0) {
-    MPI_Bcast(result_matrix.values.data(),
-              global_nnz,
-              MPI_DOUBLE,
-              0,
-              MPI_COMM_WORLD);
+  MPI_Gatherv(
+      local_matrix.col_index.data(),
+      local_nnz,
+      MPI_INT,
+      rank == 0
+          ? result_matrix.col_index.data()
+          : nullptr,
+      recv_nnz.data(),
+      displs_nnz.data(),
+      MPI_INT,
+      0,
+      MPI_COMM_WORLD);
 
-    MPI_Bcast(result_matrix.col_index.data(),
-              global_nnz,
-              MPI_INT,
-              0,
-              MPI_COMM_WORLD);
+  std::vector<int> local_row_sizes(
+      distribution.local_rows);
+
+  for (int i = 0;
+       i < distribution.local_rows;
+       ++i) {
+    local_row_sizes[i] =
+        static_cast<int>(local_values[i].size());
   }
 
-  GetOutput() = std::move(result_matrix);
+  std::vector<int> gathered_row_sizes;
+
+  if (rank == 0) {
+    gathered_row_sizes.resize(a.rows);
+  }
+
+  MPI_Gatherv(
+      local_row_sizes.data(),
+      distribution.local_rows,
+      MPI_INT,
+      rank == 0
+          ? gathered_row_sizes.data()
+          : nullptr,
+      recv_rows.data(),
+      displs_rows.data(),
+      MPI_INT,
+      0,
+      MPI_COMM_WORLD);
+
+  if (rank == 0) {
+    BuildRowPtr(result_matrix,
+                gathered_row_sizes);
+
+    GetOutput() = std::move(result_matrix);
+  }
 
   return true;
 }
