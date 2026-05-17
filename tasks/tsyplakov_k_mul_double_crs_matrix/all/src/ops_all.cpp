@@ -4,6 +4,7 @@
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <unordered_map>
