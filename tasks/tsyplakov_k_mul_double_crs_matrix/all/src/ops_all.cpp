@@ -12,11 +12,8 @@ namespace tsyplakov_k_mul_double_crs_matrix {
 
 namespace {
 
-void ComputeRow(const SparseMatrixCRS& a,
-                const SparseMatrixCRS& b,
-                int row,
-                std::vector<double>& values,
-                std::vector<int>& cols) {
+void ComputeRow(const SparseMatrixCRS &a, const SparseMatrixCRS &b, int row, std::vector<double> &values,
+                std::vector<int> &cols) {
   std::unordered_map<int, double> acc;
 
   for (int ia = a.row_ptr[row]; ia < a.row_ptr[row + 1]; ++ia) {
@@ -28,7 +25,7 @@ void ComputeRow(const SparseMatrixCRS& a,
     }
   }
 
-  for (const auto& [c, v] : acc) {
+  for (const auto &[c, v] : acc) {
     if (std::fabs(v) > 1e-12) {
       cols.push_back(c);
       values.push_back(v);
@@ -38,13 +35,13 @@ void ComputeRow(const SparseMatrixCRS& a,
 
 }  // namespace
 
-TsyplakovKTestTaskALL::TsyplakovKTestTaskALL(const InType& in) {
+TsyplakovKTestTaskALL::TsyplakovKTestTaskALL(const InType &in) {
   SetTypeOfTask(GetStaticTypeOfTask());
   GetInput() = in;
 }
 
 bool TsyplakovKTestTaskALL::ValidationImpl() {
-  const auto& in = GetInput();
+  const auto &in = GetInput();
   return in.a.cols == in.b.rows;
 }
 
@@ -53,8 +50,8 @@ bool TsyplakovKTestTaskALL::PreProcessingImpl() {
 }
 
 bool TsyplakovKTestTaskALL::RunImpl() {
-  const auto& a = GetInput().a;
-  const auto& b = GetInput().b;
+  const auto &a = GetInput().a;
+  const auto &b = GetInput().b;
 
   int rank = 0;
   int size = 1;
@@ -73,25 +70,20 @@ bool TsyplakovKTestTaskALL::RunImpl() {
   std::vector<std::vector<double>> loc_vals(local_n);
   std::vector<std::vector<int>> loc_cols(local_n);
 
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, local_n),
-      [&](const tbb::blocked_range<int>& r) {
-        for (int i = r.begin(); i < r.end(); ++i) {
-          ComputeRow(a, b, start + i, loc_vals[i], loc_cols[i]);
-        }
-      });
+  tbb::parallel_for(tbb::blocked_range<int>(0, local_n), [&](const tbb::blocked_range<int> &r) {
+    for (int i = r.begin(); i < r.end(); ++i) {
+      ComputeRow(a, b, start + i, loc_vals[i], loc_cols[i]);
+    }
+  });
 
-  // Собираем количество элементов в каждой строке
   std::vector<int> local_sizes(local_n);
   for (int i = 0; i < local_n; ++i) {
     local_sizes[i] = static_cast<int>(loc_vals[i].size());
   }
 
-  // Собираем информацию о количестве строк на каждом процессе
   std::vector<int> rows_per_proc(size);
   MPI_Gather(&local_n, 1, MPI_INT, rows_per_proc.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Вычисляем смещения для строк
   std::vector<int> row_displs(size, 0);
   if (rank == 0) {
     for (int i = 1; i < size; ++i) {
@@ -99,17 +91,13 @@ bool TsyplakovKTestTaskALL::RunImpl() {
     }
   }
 
-  // Собираем все размеры строк на нулевой процесс
   std::vector<int> flat_sizes(n, 0);
-  
-  MPI_Gatherv(local_sizes.data(), local_n, MPI_INT,
-              flat_sizes.data(), rows_per_proc.data(), row_displs.data(),
-              MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Рассылаем flat_sizes всем процессам
+  MPI_Gatherv(local_sizes.data(), local_n, MPI_INT, flat_sizes.data(), rows_per_proc.data(), row_displs.data(), MPI_INT,
+              0, MPI_COMM_WORLD);
+
   MPI_Bcast(flat_sizes.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Подготавливаем локальные данные для отправки
   std::vector<double> local_v;
   std::vector<int> local_c;
 
@@ -120,11 +108,9 @@ bool TsyplakovKTestTaskALL::RunImpl() {
     local_c.insert(local_c.end(), loc_cols[i].begin(), loc_cols[i].end());
   }
 
-  // Собираем количество ненулевых элементов на каждом процессе
   std::vector<int> nnz_counts(size);
   MPI_Gather(&local_nnz, 1, MPI_INT, nnz_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Вычисляем смещения для ненулевых элементов
   std::vector<int> nnz_disp(size, 0);
   int total_nnz = 0;
   if (rank == 0) {
@@ -134,7 +120,6 @@ bool TsyplakovKTestTaskALL::RunImpl() {
     total_nnz = nnz_disp[size - 1] + nnz_counts[size - 1];
   }
 
-  // Рассылаем nnz_counts и nnz_disp всем процессам
   MPI_Bcast(nnz_counts.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(nnz_disp.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(&total_nnz, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -143,16 +128,12 @@ bool TsyplakovKTestTaskALL::RunImpl() {
   std::vector<int> out_c(total_nnz);
   std::vector<int> out_row_ptr(n + 1, 0);
 
-  // Собираем значения и индексы столбцов на всех процессах
-  MPI_Allgatherv(local_v.data(), local_nnz, MPI_DOUBLE,
-                 out_v.data(), nnz_counts.data(), nnz_disp.data(),
-                 MPI_DOUBLE, MPI_COMM_WORLD);
+  MPI_Allgatherv(local_v.data(), local_nnz, MPI_DOUBLE, out_v.data(), nnz_counts.data(), nnz_disp.data(), MPI_DOUBLE,
+                 MPI_COMM_WORLD);
 
-  MPI_Allgatherv(local_c.data(), local_nnz, MPI_INT,
-                 out_c.data(), nnz_counts.data(), nnz_disp.data(),
-                 MPI_INT, MPI_COMM_WORLD);
+  MPI_Allgatherv(local_c.data(), local_nnz, MPI_INT, out_c.data(), nnz_counts.data(), nnz_disp.data(), MPI_INT,
+                 MPI_COMM_WORLD);
 
-  // Заполняем row_ptr на основе собранных размеров строк
   for (int i = 0; i < n; ++i) {
     out_row_ptr[i + 1] = out_row_ptr[i] + flat_sizes[i];
   }
