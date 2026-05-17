@@ -1,11 +1,14 @@
+#include "tsyplakov_k_mul_double_crs_matrix/common/include/common.hpp"
 #include "tsyplakov_k_mul_double_crs_matrix/all/include/ops_all.hpp"
 
 #include <mpi.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tsyplakov_k_mul_double_crs_matrix {
@@ -64,7 +67,7 @@ bool TsyplakovKTestTaskALL::RunImpl() {
   const int base = n / size;
   const int rem = n % size;
 
-  const int start = rank * base + std::min(rank, rem);
+  const int start = (rank * base) + std::min(rank, rem);
   const int local_n = base + (rank < rem ? 1 : 0);
 
   std::vector<std::vector<double>> loc_vals(local_n);
